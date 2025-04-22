@@ -1,1 +1,0 @@
-Namespace(data_device='cuda', eval=False, images='images', model_path='./eval/dtu_scan24/', multi_view_max_angle=30, multi_view_max_dis=1.5, multi_view_min_dis=0.01, multi_view_num=8, ncc_scale=0.5, preload_img=True, resolution=2, sh_degree=3, source_path='/home/gyh/dataset/DTU/scan24', white_background=False)
