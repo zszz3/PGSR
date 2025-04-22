@@ -45,10 +45,12 @@ __forceinline__ __device__ float ndc2Pix(float v, int S)
 
 __forceinline__ __device__ void getRect(const float2 p, int max_radius, uint2& rect_min, uint2& rect_max, dim3 grid)
 {
+	// 圆心减去半径 -> grid
 	rect_min = {
 		min(grid.x, max((int)0, (int)((p.x - max_radius) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y - max_radius) / BLOCK_Y)))
 	};
+	// 圆心加上半径 -> grid
 	rect_max = {
 		min(grid.x, max((int)0, (int)((p.x + max_radius + BLOCK_X - 1) / BLOCK_X))),
 		min(grid.y, max((int)0, (int)((p.y + max_radius + BLOCK_Y - 1) / BLOCK_Y)))
@@ -143,11 +145,15 @@ __forceinline__ __device__ bool in_frustum(int idx,
 	bool prefiltered,
 	float3& p_view)
 {
+	// 高斯球中心在世界空间下的坐标
 	float3 p_orig = { orig_points[3 * idx], orig_points[3 * idx + 1], orig_points[3 * idx + 2] };
 
 	// Bring points to screen space
+	// 世界空间坐标直接转NDC坐标，并且自动变齐次
 	float4 p_hom = transformPoint4x4(p_orig, projmatrix);
 	float p_w = 1.0f / (p_hom.w + 0.0000001f);
+	
+	// 齐次转回非齐次
 	float3 p_proj = { p_hom.x * p_w, p_hom.y * p_w, p_hom.z * p_w };
 	p_view = transformPoint4x3(p_orig, viewmatrix);
 

@@ -32,6 +32,7 @@ std::function<char*(size_t N)> resizeFunctional(torch::Tensor& t) {
     return lambda;
 }
 
+// 最外层的渲染函数，与python中的输入输出直接对应
 std::tuple<int, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
 RasterizeGaussiansCUDA(
 	const torch::Tensor& background,
@@ -60,24 +61,27 @@ RasterizeGaussiansCUDA(
     AT_ERROR("means3D must have dimensions (num_points, 3)");
   }
   
-  const int P = means3D.size(0);
+  const int P = means3D.size(0);		// 高斯点的数量
   const int H = image_height;
   const int W = image_width;
 
   auto int_opts = means3D.options().dtype(torch::kInt32);
   auto float_opts = means3D.options().dtype(torch::kFloat32);
 
-  torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);
-  torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
+  torch::Tensor out_color = torch::full({NUM_CHANNELS, H, W}, 0.0, float_opts);					// 分配显存空间用于存储渲染图
+  torch::Tensor radii = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));			// 分配显存空间用于存储每个高斯球在渲染图中的半径
   torch::Tensor out_observe = torch::full({P}, 0, means3D.options().dtype(torch::kInt32));
   torch::Tensor out_all_map = torch::full({NUM_ALL_MAP, H, W}, 0, float_opts);
   torch::Tensor out_plane_depth = torch::full({1, H, W}, 0, float_opts);
   
   torch::Device device(torch::kCUDA);
   torch::TensorOptions options(torch::kByte);
-  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));
-  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));
+  torch::Tensor geomBuffer = torch::empty({0}, options.device(device));			// 初始化, 还未分配显存空间
+  torch::Tensor binningBuffer = torch::empty({0}, options.device(device));		// 初始化, 还未分配显存空间
+  torch::Tensor imgBuffer = torch::empty({0}, options.device(device));			// 初始化, 还未分配显存空间
+
+  // resizeFunctional是一个闭包，输出一个调显存空间大小的lambda表达式
+  // geomFunc等都是用于调整显存空间的函数
   std::function<char*(size_t)> geomFunc = resizeFunctional(geomBuffer);
   std::function<char*(size_t)> binningFunc = resizeFunctional(binningBuffer);
   std::function<char*(size_t)> imgFunc = resizeFunctional(imgBuffer);
@@ -91,6 +95,7 @@ RasterizeGaussiansCUDA(
 		M = sh.size(1);
       }
 
+	  // 调用CudaRasterizer::Rasterizer::forward执行渲染，结果构造为Python里的tuple：
 	  rendered = CudaRasterizer::Rasterizer::forward(
 	    geomFunc,
 		binningFunc,

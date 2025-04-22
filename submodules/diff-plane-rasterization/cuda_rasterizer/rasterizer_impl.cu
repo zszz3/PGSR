@@ -99,11 +99,11 @@ __global__ void duplicateWithKeys(
 		{
 			for (int x = rect_min.x; x < rect_max.x; x++)
 			{
-				uint64_t key = y * grid.x + x;
-				key <<= 32;
-				key |= *((uint32_t*)&depths[idx]);
+				uint64_t key = y * grid.x + x;			// key的上半边是tile ID，即tile的xy坐标的组合
+				key <<= 32;								// tile ID作为key的上半边
+				key |= *((uint32_t*)&depths[idx]);		// key的下半边为该高斯球中心的深度
 				gaussian_keys_unsorted[off] = key;
-				gaussian_values_unsorted[off] = idx;
+				gaussian_values_unsorted[off] = idx;	// value值为高斯球的编号
 				off++;
 			}
 		}
@@ -155,6 +155,7 @@ void CudaRasterizer::Rasterizer::markVisible(
 CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& chunk, size_t P)
 {
 	GeometryState geom;
+	// 其中obtain就是把chunk开始的一段显存空间首地址赋值给ptr然后对chunk自增：
 	obtain(chunk, geom.depths, P, 128);
 	obtain(chunk, geom.clamped, P * 3, 128);
 	obtain(chunk, geom.internal_radii, P, 128);
@@ -163,6 +164,12 @@ CudaRasterizer::GeometryState CudaRasterizer::GeometryState::fromChunk(char*& ch
 	obtain(chunk, geom.conic_opacity, P, 128);
 	obtain(chunk, geom.rgb, P * 3, 128);
 	obtain(chunk, geom.tiles_touched, P, 128);
+	/*
+		geom.tiles_touched: 输入
+		geom.tiles_touched: 输出
+		最后一个num。当第一个参数为NULL时, 所需的分配大小被写入第二个参数，并且不执行任何工作
+		算出计算数组前缀和所需的内存空间大小，InclusiveSum表示包括自身，ExclusiveSum表示不包括自身
+	*/
 	cub::DeviceScan::InclusiveSum(nullptr, geom.scan_size, geom.tiles_touched, geom.tiles_touched, P);
 	obtain(chunk, geom.scanning_space, geom.scan_size, 128);
 	obtain(chunk, geom.point_offsets, P, 128);
@@ -195,6 +202,7 @@ CudaRasterizer::BinningState CudaRasterizer::BinningState::fromChunk(char*& chun
 
 // Forward rendering procedure for differentiable rasterization
 // of Gaussians.
+// 渲染过程的入口
 int CudaRasterizer::Rasterizer::forward(
 	std::function<char* (size_t)> geometryBuffer,
 	std::function<char* (size_t)> binningBuffer,
@@ -227,22 +235,23 @@ int CudaRasterizer::Rasterizer::forward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	size_t chunk_size = required<GeometryState>(P);
-	char* chunkptr = geometryBuffer(chunk_size);
-	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);
+	size_t chunk_size = required<GeometryState>(P);						// 计算所需的显存大小
+	char* chunkptr = geometryBuffer(chunk_size);						// 分配显存块，并返回首地址
+	GeometryState geomState = GeometryState::fromChunk(chunkptr, P);	// 将分配的显存块初始化为GeometryState,具体就是将chunk的显存空间的首地址赋值给geomState(一个结构体)的每个指针
 
 	if (radii == nullptr)
 	{
 		radii = geomState.internal_radii;
 	}
 
+	// 图像划分为16x16的tiles，xy方向上各有多少tiles	
 	dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	dim3 block(BLOCK_X, BLOCK_Y, 1);
+	dim3 block(BLOCK_X, BLOCK_Y, 1);										
 
 	// Dynamically resize image-based auxiliary buffers during training
-	size_t img_chunk_size = required<ImageState>(width * height);
-	char* img_chunkptr = imageBuffer(img_chunk_size);
-	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);
+	size_t img_chunk_size = required<ImageState>(width * height);					// 计算所需的显存大小
+	char* img_chunkptr = imageBuffer(img_chunk_size);								// 分配显存块，返回首地址
+	ImageState imgState = ImageState::fromChunk(img_chunkptr, width * height);		// 将分配的显存块初始化为ImageState
 
 	if (NUM_CHANNELS != 3 && colors_precomp == nullptr)
 	{
@@ -250,6 +259,7 @@ int CudaRasterizer::Rasterizer::forward(
 	}
 
 	// Run preprocessing per-Gaussian (transformation, bounding, conversion of SHs to RGB)
+	// FORWARD::preprocess计算每一个高斯球投影出来的圆半径及覆盖的范围。
 	CHECK_CUDA(FORWARD::preprocess(
 		P, D, M,
 		means3D,
@@ -277,20 +287,39 @@ int CudaRasterizer::Rasterizer::forward(
 		prefiltered
 	), debug)
 
+	// 排序的过程，代码一直到CHECK_CUDA(, debug)
+	// 64位，前32位是tile的序号，后32位是高斯的深度
+	
 	// Compute prefix sum over full list of touched tile counts by Gaussians
-	// E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	// 计算前缀和,E.g., [2, 3, 0, 2, 1] -> [2, 5, 5, 7, 8]
+	// args[0]: 额外需要的临时显存空间
+	// args[1]: 临时显存空间的大小
+	// args[2]: 输入指针(tiles_touched:每个高斯对应的tile数量)
+	// args[3]: 输出指针(point_offsets:每个高斯对应的覆盖的tiles的显存空间的起点)
+	// args[4]: 高斯的数量
+	// 计算tiles_touched数组的前缀和存到point_offsets中，从后面的代码可以看出，
+	// 每个高斯椭球都在BinningState都分配了一片显存空间存储与其相交的所有tiles的数据，
+	// 每个高斯椭球相交的tiles数量都不一样，这里point_offsets就存着每个高斯椭球对应的显存空间起点
 	CHECK_CUDA(cub::DeviceScan::InclusiveSum(geomState.scanning_space, geomState.scan_size, geomState.tiles_touched, geomState.point_offsets, P), debug)
 
 	// Retrieve total number of Gaussian instances to launch and resize aux buffers
 	int num_rendered;
+	// 指针point_offsets+P-1是point_offsets数组(tiles_touched数组的前缀和数组)的最后一个元素的值，
+	// 也即总共覆盖的tiles数量，把它赋给num_rendered，所以num_rendered就是需要渲染的tiles总量，被多个高斯球覆盖的tiles重复计数
 	CHECK_CUDA(cudaMemcpy(&num_rendered, geomState.point_offsets + P - 1, sizeof(int), cudaMemcpyDeviceToHost), debug);
 
+	// 计算所需的显存大小
 	size_t binning_chunk_size = required<BinningState>(num_rendered);
+	// 分配显存块，返回首地址
 	char* binning_chunkptr = binningBuffer(binning_chunk_size);
+	// 将分配的显存块初始化为BinningState，每个高斯椭球都在BinningState都分配了一片显存空间存储与其相交的所有tiles的数据
 	BinningState binningState = BinningState::fromChunk(binning_chunkptr, num_rendered);
 
 	// For each instance to be rendered, produce adequate [ tile | depth ] key 
 	// and corresponding dublicated Gaussian indices to be sorted
+	// duplicateWithKeys就是将每个高斯椭球深度和相交tiles的编号组合成key放进gaussian_keys_unsorted里
+	// 高斯椭球编号放进gaussian_values_unsorted里
+	// 组合的key: 64位，前32位是tile的序号，后32位是高斯的深度
 	duplicateWithKeys << <(P + 255) / 256, 256 >> > (
 		P,
 		geomState.means2D,
@@ -302,6 +331,7 @@ int CudaRasterizer::Rasterizer::forward(
 		tile_grid)
 	CHECK_CUDA(, debug)
 
+	// 查找最高有效位(most significant bit)，排序算法cub::DeviceRadixSort::SortPairs中需要
 	int bit = getHigherMsb(tile_grid.x * tile_grid.y);
 
 	// Sort complete list of (duplicated) Gaussian indices by keys
@@ -312,6 +342,8 @@ int CudaRasterizer::Rasterizer::forward(
 		binningState.point_list_unsorted, binningState.point_list,
 		num_rendered, 0, 32 + bit), debug)
 
+	// 每个tile分配两个uint，每个要渲染的key都启动一个identifyTileRanges检查是否是point_list_keys上的tile起点或终点
+	// 如果是，将idx写入imgState.ranges：
 	CHECK_CUDA(cudaMemset(imgState.ranges, 0, tile_grid.x * tile_grid.y * sizeof(uint2)), debug);
 
 	// Identify start and end of per-tile workloads in sorted list
@@ -322,8 +354,10 @@ int CudaRasterizer::Rasterizer::forward(
 			imgState.ranges);
 	CHECK_CUDA(, debug)
 
+
 	// Let each tile blend its range of Gaussians independently in parallel
 	const float* feature_ptr = colors_precomp != nullptr ? colors_precomp : geomState.rgb;
+	// 对grid个tile各启动block(16x16)个线程,即每个像素一个线程运行renderCUDA
 	CHECK_CUDA(FORWARD::render(
 		tile_grid, block,
 		imgState.ranges,
@@ -401,8 +435,8 @@ void CudaRasterizer::Rasterizer::backward(
 	const float focal_y = height / (2.0f * tan_fovy);
 	const float focal_x = width / (2.0f * tan_fovx);
 
-	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);
-	const dim3 block(BLOCK_X, BLOCK_Y, 1);
+	const dim3 tile_grid((width + BLOCK_X - 1) / BLOCK_X, (height + BLOCK_Y - 1) / BLOCK_Y, 1);		//图像划分为16x16的tiles，xy方向上各有多少tiles
+	const dim3 block(BLOCK_X, BLOCK_Y, 1);				//16x16
 
 	// Compute loss gradients w.r.t. 2D mean position, conic matrix,
 	// opacity and RGB of Gaussians from per-pixel loss gradients.

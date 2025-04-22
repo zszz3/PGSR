@@ -396,6 +396,7 @@ __global__ void preprocessCUDA(
 }
 
 // Backward version of the rendering procedure.
+// 每个像素一个renderCUDA线程
 template <uint32_t C,uint32_t MAP_N>
 __global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)
 renderCUDA(
@@ -448,14 +449,18 @@ renderCUDA(
 
 	// In the forward, we stored the final value for T, the
 	// product of all (1 - alpha) factors. 
+	// 该像素在alpha blending时积累的透明度
 	const float T_final = inside ? final_Ts[pix_id] : 0;
 	float T = T_final;
 
 	// We start from the back. The ID of the last contributing
-	// Gaussian is known from each pixel from the forward.
+	// Gaussian is known from each pixel from the forward.‘
+	// 参与该像素alpha blending的高斯球数量
 	uint32_t contributor = toDo;
+	// 参与该像素alpha blending的最后一个高斯球
 	const int last_contributor = inside ? n_contrib[pix_id] : 0;
-
+	
+	// 	float accum_rec[C] = { 0 };
 	float accum_rec[C] = { 0 };
 	float accum_all_map[MAP_N] = { 0 };
 	float dL_dpixel[C];
@@ -685,21 +690,21 @@ void BACKWARD::render(
 	int W, int H,
 	float fx, float fy,
 	const float* bg_color,
-	const float2* means2D,
-	const float4* conic_opacity,
-	const float* colors,
+	const float2* means2D,				// 高斯球投影在像平面上的2D均值位置
+	const float4* conic_opacity,		// 高斯球投影在像平面上的2D协方差矩阵（叠加透明度）
+	const float* colors,				// 高斯球在该相机视角下的颜色
 	const float* all_maps,
 	const float* all_map_pixels,
 	const float* final_Ts,
 	const uint32_t* n_contrib,
-	const float* dL_dpixels,
+	const float* dL_dpixels,			// 从Pytorch中传过来的渲染图上每个像素的梯度
 	const float* dL_dout_all_map,
 	const float* dL_dout_plane_depth,
-	float3* dL_dmean2D,
+	float3* dL_dmean2D,					// 高斯球投影在像平面上的2D均值位置的梯度（待求解）
 	float3* dL_dmean2D_abs,
-	float4* dL_dconic2D,
-	float* dL_dopacity,
-	float* dL_dcolors,
+	float4* dL_dconic2D,				// 高斯球投影在像平面上的2D协方差矩阵（不叠加透明度）的梯度（待求解）
+	float* dL_dopacity,					// 高斯球透明度的梯度（待求解）
+	float* dL_dcolors,					// 高斯球颜色的梯度（待求解）
 	float* dL_dall_map,
 	const bool render_geo)
 {
